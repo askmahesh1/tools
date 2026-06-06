@@ -7,7 +7,7 @@ import argparse
 import shlex
 import time
 
-def run_command(cmd, ssh_host=None):
+def run_command(cmd, ssh_host=None, input_data=None):
     """
     Runs a command either locally or remotely via SSH.
     cmd can be a list of args or a string.
@@ -21,12 +21,12 @@ def run_command(cmd, ssh_host=None):
         else:
             cmd_str = cmd
         ssh_cmd = ["ssh", ssh_host, cmd_str]
-        result = subprocess.run(ssh_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        result = subprocess.run(ssh_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, input=input_data)
         return result.stdout, result.stderr, result.returncode
     else:
         # Local execution
         shell = isinstance(cmd, str)
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=shell)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=shell, input=input_data)
         return result.stdout, result.stderr, result.returncode
 def initialize_sudo(ssh_host=None, use_sudo=False):
     """
@@ -131,6 +131,11 @@ def main():
         action="store_true",
         help="Use sudo for Proxmox commands (needed if SSH user is not root)."
     )
+    parser.add_argument(
+        "--input", "-i",
+        default="\n",
+        help="Input to send to the command's stdin (default: '\\n' to simulate Enter)."
+    )
 
     args = parser.parse_args()
 
@@ -140,6 +145,9 @@ def main():
         print("Running in LOCAL mode directly on the Proxmox host.")
     else:
         print(f"Running in REMOTE mode using SSH to connect to {ssh_host}.")
+
+    # Unescape newline/carriage return characters if passed via command line
+    container_input = args.input.replace('\\n', '\n').replace('\\r', '\r')
 
     # 0. Initialize sudo if requested
     if args.sudo:
@@ -236,53 +244,84 @@ def main():
     print("=" * 60)
 
     results = []
-    for t in targets:
-        vmid = t["vmid"]
-        name = t["name"]
-        node = t["node"]
-        
-        print(f"\n>>> [{vmid}] Updating {name} on node '{node}'...")
-        
-        # Build command structure
-        container_cmd_str = f"/bin/sh -c {shlex.quote(args.cmd)}"
-        pct_cmd = f"pct exec {vmid} -- {container_cmd_str}"
-        if args.sudo:
-            pct_cmd = f"sudo {pct_cmd}"
-        
-        if entrypoint_node and node != entrypoint_node:
-            ssh_prefix = "sudo ssh" if args.sudo else "ssh"
-            final_pve_cmd = f"{ssh_prefix} -o StrictHostKeyChecking=no root@{node} {shlex.quote(pct_cmd)}"
-        else:
-            final_pve_cmd = pct_cmd
+    interrupted = False
+    try:
+        for t in targets:
+            vmid = t["vmid"]
+            name = t["name"]
+            node = t["node"]
             
-        start_time = time.time()
-        stdout, stderr, code = run_command(final_pve_cmd, ssh_host)
-        elapsed = time.time() - start_time
-        
-        if code == 0:
-            print(f"✓ [{vmid}] Success ({elapsed:.1f}s)")
-            status_str = "SUCCESS"
-        else:
-            print(f"✗ [{vmid}] Failed with code {code} ({elapsed:.1f}s)")
-            status_str = f"FAILED (Exit Code {code})"
+            print(f"\n>>> [{vmid}] Updating {name} on node '{node}'...")
             
-        if stdout.strip():
-            print("--- Output ---")
-            print(stdout.strip())
-        if stderr.strip():
-            print("--- Error ---", file=sys.stderr)
-            print(stderr.strip(), file=sys.stderr)
+            # Build command structure
+            container_cmd_str = f"/bin/sh -c {shlex.quote(args.cmd)}"
+            pct_cmd = f"pct exec {vmid} -- {container_cmd_str}"
+            if args.sudo:
+                pct_cmd = f"sudo {pct_cmd}"
             
-        results.append({
-            "vmid": vmid,
-            "name": name,
-            "node": node,
-            "status": status_str,
-            "duration": f"{elapsed:.1f}s",
-            "output": stdout,
-            "error": stderr
-        })
-        print("-" * 60)
+            if entrypoint_node and node != entrypoint_node:
+                ssh_prefix = "sudo ssh" if args.sudo else "ssh"
+                final_pve_cmd = f"{ssh_prefix} -o StrictHostKeyChecking=no root@{node} {shlex.quote(pct_cmd)}"
+            else:
+                final_pve_cmd = pct_cmd
+                
+            start_time = time.time()
+            try:
+                stdout, stderr, code = run_command(final_pve_cmd, ssh_host, input_data=container_input)
+                elapsed = time.time() - start_time
+                
+                if code == 0:
+                    print(f"✓ [{vmid}] Success ({elapsed:.1f}s)")
+                    status_str = "SUCCESS"
+                else:
+                    print(f"✗ [{vmid}] Failed with code {code} ({elapsed:.1f}s)")
+                    status_str = f"FAILED (Exit Code {code})"
+                    
+                if stdout.strip():
+                    print("--- Output ---")
+                    print(stdout.strip())
+                if stderr.strip():
+                    print("--- Error ---", file=sys.stderr)
+                    print(stderr.strip(), file=sys.stderr)
+                    
+                results.append({
+                    "vmid": vmid,
+                    "name": name,
+                    "node": node,
+                    "status": status_str,
+                    "duration": f"{elapsed:.1f}s",
+                    "output": stdout,
+                    "error": stderr
+                })
+            except KeyboardInterrupt:
+                elapsed = time.time() - start_time
+                print(f"\n✗ [{vmid}] Interrupted by user ({elapsed:.1f}s)")
+                results.append({
+                    "vmid": vmid,
+                    "name": name,
+                    "node": node,
+                    "status": "CANCELLED",
+                    "duration": f"{elapsed:.1f}s",
+                    "output": "",
+                    "error": "KeyboardInterrupt"
+                })
+                # Add any remaining targets as SKIPPED
+                current_idx = targets.index(t)
+                for remaining_t in targets[current_idx + 1:]:
+                    results.append({
+                        "vmid": remaining_t["vmid"],
+                        "name": remaining_t["name"],
+                        "node": remaining_t["node"],
+                        "status": "SKIPPED",
+                        "duration": "N/A",
+                        "output": "",
+                        "error": ""
+                    })
+                interrupted = True
+                break
+            print("-" * 60)
+    except KeyboardInterrupt:
+        interrupted = True
 
     # 4. Print final summary table
     print("\n" + "=" * 60)
@@ -294,5 +333,13 @@ def main():
         print(f"{r['vmid']:<8} {r['name']:<20} {r['node']:<10} {r['duration']:<10} {r['status']:<15}")
     print("=" * 60)
 
+    if interrupted:
+        print("\nExecution aborted.")
+        sys.exit(130)
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nExecution cancelled by user. Exiting.")
+        sys.exit(130)
